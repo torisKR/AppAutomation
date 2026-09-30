@@ -133,7 +133,7 @@ Diagnostics:
     appforge providers
     appforge computer status
 
-Install/configure CUA Driver only when needed:
+Install/configure CUA Driver when needed:
 
     appforge computer setup
 
@@ -161,8 +161,9 @@ CUA Driver is the shared GUI/browser layer. AppForge does not modify global Code
 
 - **Codex** receives a per-run `mcp_servers.computer = cua-driver mcp` override and continues to use the ChatGPT-authenticated Codex session.
 - **Claude** receives a per-run `--mcp-config` pointing to `cua-driver mcp` and continues to use the Claude subscription session.
-- If CUA Driver is missing, `appforge setup` / `appforge computer setup` can launch CUA's official installer after confirmation.
-- Missing Accessibility/Screen Recording permission is surfaced and the official CUA permission flow can be launched.
+- If CUA Driver is missing, `appforge setup` / `appforge computer setup` offers CUA's official installer and defaults to installing unless explicitly declined.
+- Before any computer-use task, AppForge self-starts the CUA daemon in the default `standard` permission mode if the driver is installed but stopped.
+- On macOS, permission setup starts `CuaDriver.app` before requesting Accessibility/Screen Recording so TCC grants belong to the signed driver app.
 
 When draft store upload is enabled, the Store stage writes an app-specific `.appforge/store-upload-request.conf` containing the exact package/bundle identifier, bounded draft actions, and SHA-256 values for requested artifacts. External actions do **not** run immediately.
 
@@ -185,8 +186,8 @@ Two workflows are included:
 
 Create a release (the tag must match `Cargo.toml`):
 
-    git tag v0.2.0
-    git push origin v0.2.0
+    git tag v0.2.1
+    git push origin v0.2.1
 
 The workflow publishes:
 
@@ -224,7 +225,7 @@ The factory can prepare CI, store metadata, signing placeholders, screenshots/ch
 
 ### Review safety gates and compatibility
 
-Older config files keep their provider/project settings; absent Notion and store fields remain disabled. Setup requires a terminal and external publishing/upload options default to No. CUA discovery also checks `~/.local/bin`; readiness checks never grant permissions or start a daemon. Run `appforge computer setup` explicitly to install or grant permissions.
+Older config files keep their provider/project settings; absent Notion and store fields remain disabled. Setup requires a terminal and external publishing/upload options default to No. CUA discovery also checks `~/.local/bin`. Read-only `computer status` never mutates permissions, while `computer setup` can install the driver, start its standard-mode daemon, and launch the official permission flow. Computer-use tasks may self-start an already-installed stopped daemon but never grant OS permissions silently.
 
 Quality and QA must write a fresh `.appforge/quality-decision` or `.appforge/qa-decision` containing exactly `PASS` or `BLOCKED`, plus their nonempty report. A zero CLI exit status alone does not pass the gate. Starting Quality invalidates prior QA approval. Publish and Release refuse missing or blocked decisions; old projects must run `repair` to produce these gates. `repair-all` continues after failures and returns a failing exit status with the affected projects.
 

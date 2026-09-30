@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1 — 2026-09-30
+
+### Fixed
+
+- CUA Driver now self-starts in standard mode before computer-use tasks instead of failing after reboot when the daemon is stopped.
+- macOS permission setup now starts `CuaDriver.app` first so Accessibility and Screen Recording prompts are attributed to the signed driver app.
+- `appforge computer setup` defaults to installing CUA Driver and granting required OS permissions unless the user explicitly declines.
+- CUA daemon readiness polling now checks only daemon state instead of repeatedly probing both daemon and permissions, reducing subprocess churn during startup.
+
+### Verified
+
+- Current CUA Driver installer and permission flow match the official `cua.ai` documentation.
+- Existing GUI automation is live on macOS: driver daemon, Accessibility, Screen Recording, and app enumeration are all operational.
+
 ## 0.2.0 — 2026-09-30
 
 ### Added

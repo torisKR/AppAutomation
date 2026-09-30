@@ -33,7 +33,9 @@ Run:
     appforge computer status
     appforge computer setup
 
-If CUA Driver is missing, setup offers the official CUA installer. It does not install silently.
+If CUA Driver is missing, setup offers the official CUA installer and defaults to installing unless explicitly declined.
+
+If the driver is installed but its daemon is stopped, setup and computer-use tasks start it in the default `standard` permission mode. On macOS AppForge launches `CuaDriver.app --args serve` before requesting TCC permissions so Accessibility and Screen Recording are attributed to the signed driver app.
 
 If Accessibility or Screen Recording is missing on macOS, setup launches the official CUA permission flow. Login, passwords, passkeys, and MFA stay with the human.
 

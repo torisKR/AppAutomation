@@ -95,16 +95,22 @@ fn output(name: &str, args: &[&str]) -> io::Result<(bool, String)> {
     Ok((status.success(), text))
 }
 
+fn daemon_is_running() -> bool {
+    output("cua-driver", &["status"])
+        .map(|(ok, text)| daemon_ready(ok, &text))
+        .unwrap_or(false)
+}
+
+fn permissions_are_ready() -> bool {
+    output("cua-driver", &["permissions", "status"])
+        .map(|(ok, text)| permissions_ready(ok, &text))
+        .unwrap_or(false)
+}
+
 pub fn status() -> ComputerStatus {
     let cua_installed = has_binary("cua-driver");
-    let daemon_running = cua_installed
-        && output("cua-driver", &["status"])
-            .map(|(ok, text)| daemon_ready(ok, &text))
-            .unwrap_or(false);
-    let permissions_ready = cua_installed
-        && output("cua-driver", &["permissions", "status"])
-            .map(|(ok, text)| permissions_ready(ok, &text))
-            .unwrap_or(false);
+    let daemon_running = cua_installed && daemon_is_running();
+    let permissions_ready = cua_installed && permissions_are_ready();
 
     ComputerStatus {
         cua_installed,
@@ -189,6 +195,74 @@ pub fn install_cua() -> io::Result<()> {
     Ok(())
 }
 
+fn start_daemon() -> io::Result<()> {
+    if !has_binary("cua-driver") {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "cua-driver is not installed",
+        ));
+    }
+    if daemon_is_running() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let launch = Command::new("open")
+            .args(["-n", "-g", "-a", "CuaDriver", "--args", "serve"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !launch.success() {
+            return Err(io::Error::other(format!(
+                "failed to start CUA Driver app daemon: {launch}"
+            )));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let driver = driver_binary().ok_or_else(|| io::Error::other("CUA Driver missing"))?;
+        Command::new(&driver)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let driver = driver_binary().ok_or_else(|| io::Error::other("CUA Driver missing"))?;
+        let kicked = Command::new(&driver)
+            .args(["autostart", "kick"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !kicked.success() {
+            Command::new(&driver)
+                .arg("serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
+    }
+
+    for _ in 0..20 {
+        if daemon_is_running() {
+            return Ok(());
+        }
+        thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    Err(io::Error::other(
+        "CUA Driver daemon did not become ready; run cua-driver doctor",
+    ))
+}
+
 pub fn grant_permissions() -> io::Result<()> {
     if !has_binary("cua-driver") {
         return Err(io::Error::new(
@@ -196,6 +270,7 @@ pub fn grant_permissions() -> io::Result<()> {
             "cua-driver is not installed",
         ));
     }
+    start_daemon()?;
     let status =
         Command::new(driver_binary().ok_or_else(|| io::Error::other("CUA Driver missing"))?)
             .args(["permissions", "grant"])
@@ -221,22 +296,26 @@ pub fn setup_interactive() -> io::Result<()> {
     let current = status();
     println!("Computer Use: {}", current.summary());
     if !current.cua_installed {
-        print!("CUA Driver가 없습니다. 공식 설치 스크립트로 설치할까요? [y/N]: ");
+        print!("CUA Driver가 없습니다. 공식 설치 스크립트로 설치할까요? [Y/n]: ");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
-        if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
             install_cua()?;
         }
     }
 
+    if status().cua_installed {
+        start_daemon()?;
+    }
+
     let current = status();
     if current.cua_installed && !current.permissions_ready {
-        print!("CUA Driver OS 권한을 설정할까요? [y/N]: ");
+        print!("CUA Driver OS 권한을 설정할까요? [Y/n]: ");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
-        if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
             grant_permissions()?;
         }
     }
@@ -379,6 +458,9 @@ pub fn run_agent_task(
     prompt: &str,
     tx: Sender<String>,
 ) -> io::Result<String> {
+    if has_binary("cua-driver") && !daemon_is_running() {
+        start_daemon()?;
+    }
     let current = status();
     if !current.ready() {
         return Err(io::Error::new(

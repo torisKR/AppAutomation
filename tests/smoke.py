@@ -40,7 +40,7 @@ for gate, keyword, report in [('quality', 'FUNCTIONAL + PERFORMANCE', '04-qualit
         assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
         return result
 
-    assert '0.2.0' in run('version').stdout
+    assert '0.2.1' in run('version').stdout
     help_text = run('help').stdout
     assert 'repair-all' in help_text and 'approve-publish' in help_text and 'publish [project]' in help_text
     assert 'daemon=no' in run('computer', 'status').stdout
