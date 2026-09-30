@@ -12,6 +12,9 @@ AppForge is a Rust control-plane binary. It owns:
 - worker stdout/stderr streaming
 - generated-project workspace creation
 - Aside Browser research lanes
+- functional/performance repair gates
+- Codex/Claude + CUA Driver computer-use sessions
+- Notion policy publishing and draft store-upload prompts
 - release-oriented prompts
 
 It does not proxy model HTTP APIs.
@@ -38,15 +41,17 @@ Default role assignment:
 - Plan: primary
 - Design: secondary[0]
 - Build: secondary[1], falling back to secondary[0]
+- Functional/performance repair: primary; uses CUA when ready
 - QA: primary
-- Store: secondary[0]
+- Store/policy generation: secondary[0]
+- Notion/store draft upload: Codex or Claude controller + CUA Driver
 - Release: primary
 
 If strict subscription auth is enabled and OpenCode is selected for a stage, AppForge falls back to a non-OpenCode enabled provider because OpenCode Go currently uses a subscription key rather than OAuth.
 
 ## Aside lane
 
-Aside runs once per pipeline stage in Guard mode.
+Aside runs only on the stages where fresh web context materially helps (plan, design, store, and release), in Guard mode.
 
 Outputs are stored under docs/aside/<stage>.md and become input to the coding agent at that stage.
 
@@ -67,7 +72,9 @@ Every generated project gets:
 - AGENTS.md
 - docs/
 - docs/aside/
+- docs/policies/
 - .appforge/project.conf
+- .appforge/policy-links.conf after successful policy publication
 - stage status markers under .appforge/
 - a local git repository
 
@@ -81,3 +88,19 @@ The terminal control loop has two modes:
 - MANUAL: a stage starts only after the user sends run/Enter
 
 Ctrl+C requests MANUAL mode. If an external CLI also reacts to terminal SIGINT, the current stage may fail and can then be rerun manually; AppForge does not conceal the failure.
+
+## Computer-use boundary
+
+AppForge uses CUA Driver as the shared computer/browser transport. The AI controller is either Codex or Claude and is selected by config.
+
+- Codex receives CUA as an ephemeral `mcp_servers.computer` override.
+- Claude receives CUA as an ephemeral `--mcp-config`.
+- No persistent provider MCP configuration is modified.
+- CUA runs with its existing daemon permission mode; AppForge does not start it in unrestricted mode.
+- Notion publishing is scoped to newly created app-policy pages, never the configured parent page.
+- Store automation is draft-only and requires an exact existing app identifier match.
+- Final review submission, production rollout, agreements, pricing changes, account changes, and MFA remain human-controlled.
+
+## Quality gate
+
+The quality stage detects the generated app's actual stack, runs available build/lint/type/test/doctor checks, exercises the primary flow, and fixes verified functional or performance defects. When CUA is ready, the stage may also perform runtime UI verification. It records before/after evidence in `docs/04-quality.md`; QA then rechecks those findings before store preparation.

@@ -45,7 +45,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-          components: rustfmt
+          components: rustfmt,clippy
 
       - name: Validate tag against Cargo version
         shell: bash
@@ -62,10 +62,12 @@ jobs:
               raise SystemExit(f"Release tag must match Cargo.toml: {expected}")
           PY
 
-      - name: Check formatting and test
+      - name: Check formatting, test, and clippy
+        shell: bash
         run: |
           cargo fmt --check
           cargo test --locked
+          cargo clippy --all-targets --locked --target "${{ matrix.target }}" -- -D warnings
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

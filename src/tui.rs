@@ -124,6 +124,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut state = State::new(cfg);
     let mut input = Input::default();
     let mut buttons = Vec::new();
+    let mut input_closed = false;
     state.push_log("AppForge ready. Type a product/game brief and press Enter.");
     state.push_log("Controls: auto · manual · run · new <brief> · quit");
     state.push_log("Ctrl+C switches to manual mode; active work is not cancelled.");
@@ -148,6 +149,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     Vec::new()
                 }
                 InputEvent::Closed => {
+                    input_closed = true;
                     // Losing input must never continue unattended execution.
                     handle_command(&mut state, "manual".into(), &worker_tx)?;
                     if !state.running {
@@ -172,6 +174,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
                     }
                 }
             }
+        }
+
+        if input_closed && !state.running {
+            return Ok(());
         }
 
         if state.auto
@@ -276,7 +282,12 @@ fn start_current_stage(state: &mut State, worker_tx: &Sender<WorkerEvent>) {
     let stage = Stage::all()[state.stage_index];
     state.running = true;
     state.steps[state.stage_index] = StepState::Running;
-    let provider_id = orchestrator::provider_for(&state.cfg, stage);
+    let provider_id = if stage == Stage::Publish {
+        crate::computer::controller(&state.cfg)
+            .unwrap_or_else(|| orchestrator::provider_for(&state.cfg, stage))
+    } else {
+        orchestrator::provider_for(&state.cfg, stage)
+    };
     state.push_log(format!(
         "Starting {} with {}",
         stage.title(),
@@ -313,6 +324,7 @@ fn drain_worker_events(state: &mut State, rx: &Receiver<WorkerEvent>) {
                         if idx < state.steps.len() {
                             state.steps[idx] = StepState::Done;
                         }
+                        state.last_error = None;
                         state.stage_index = idx.saturating_add(1);
                         state.push_log(format!(
                             "{} ✓ by {}",
@@ -321,7 +333,7 @@ fn drain_worker_events(state: &mut State, rx: &Receiver<WorkerEvent>) {
                         ));
                         if state.complete() {
                             state.push_log(
-                                "Pipeline complete. Review docs/06-release.md before store submission.",
+                                "Pipeline complete. Review docs/08-release.md and docs/07-publish.md before final store submission.",
                             );
                         }
                     }
@@ -543,7 +555,11 @@ fn provider_lines(state: &State, width: usize, rows: usize) -> Vec<String> {
 
 fn pipeline_lines(state: &State, width: usize, rows: usize) -> Vec<String> {
     let mut out = vec![" PIPELINE".into(), "".into()];
-    for (idx, stage) in Stage::all().iter().enumerate() {
+    let capacity = rows.saturating_sub(2);
+    let first = state
+        .stage_index
+        .min(Stage::all().len().saturating_sub(capacity));
+    for (idx, stage) in Stage::all().iter().enumerate().skip(first).take(capacity) {
         let marker = match state.steps.get(idx).copied().unwrap_or(StepState::Pending) {
             StepState::Pending => "·",
             StepState::Running => "▶",
@@ -551,13 +567,6 @@ fn pipeline_lines(state: &State, width: usize, rows: usize) -> Vec<String> {
             StepState::Failed => "✗",
         };
         out.push(truncate(&format!("{marker} {}", stage.title()), width));
-        out.push(truncate(
-            &format!(
-                "  ↳ {}",
-                provider::label(&orchestrator::provider_for(&state.cfg, *stage))
-            ),
-            width,
-        ));
     }
     if let Some(err) = &state.last_error {
         out.push(String::new());
@@ -605,6 +614,15 @@ fn pad(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_pipeline_view_tracks_current_stage() {
+        let mut state = State::new(Config::default());
+        state.stage_index = 7;
+        let lines = pipeline_lines(&state, 80, 5);
+        assert!(lines.iter().any(|line| line.contains("08 Release")));
+        assert_eq!(pipeline_lines(&state, 80, 10).len(), 10);
+    }
 
     #[test]
     fn truncate_is_bounded() {

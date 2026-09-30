@@ -1,14 +1,29 @@
 use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, IsTerminal, Write};
+use std::path::{Component, Path, PathBuf};
+
+use crate::config::Config;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn create(root: &Path, brief: &str) -> io::Result<PathBuf> {
     fs::create_dir_all(root)?;
     let slug = slugify(brief);
-    let path = unique_path(root, &slug);
+    let mut suffix = 0;
+    let path = loop {
+        let candidate = if suffix == 0 {
+            root.join(&slug)
+        } else {
+            root.join(format!("{slug}-{suffix}"))
+        };
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(err) => return Err(err),
+        }
+    };
     fs::create_dir_all(path.join("docs/aside"))?;
+    fs::create_dir_all(path.join("docs/policies"))?;
     fs::create_dir_all(path.join(".appforge"))?;
 
     fs::write(
@@ -23,7 +38,7 @@ pub fn create(root: &Path, brief: &str) -> io::Result<PathBuf> {
     fs::write(
         path.join("README.md"),
         format!(
-            "# {}\n\nGenerated and orchestrated by AppForge.\n\n## Product brief\n\n{}\n\n## Workflow\n\n1. Product plan\n2. UX/game design\n3. Implementation\n4. QA/review\n5. Store preparation\n6. Release preparation\n",
+            "# {}\n\nGenerated and orchestrated by AppForge.\n\n## Product brief\n\n{}\n\n## Workflow\n\n1. Product plan\n2. UX/game design\n3. Implementation\n4. Functional & performance repair\n5. QA/review\n6. Store & policy preparation\n7. Notion/store draft upload\n8. Release preparation\n",
             display_name(&slug),
             brief
         ),
@@ -65,9 +80,13 @@ fn agent_instructions(brief: &str) -> String {
 - Read prior stage documents under docs/ before making changes.
 - Keep commits and generated assets deterministic where practical.
 - Add tests, lint/typecheck commands, and a reproducible build path.
+- Treat docs/04-quality.md as a repair gate: find functional and measurable performance weaknesses, fix verified issues, then record before/after evidence.
+- Generate policy documents from verified code/data behavior under docs/policies/; never invent privacy claims.
 - Prepare store listing copy, privacy/data notes, icon/screenshot requirements, and release checklist before declaring release-ready.
 - Browser-side research or console work may be delegated to Aside Browser; treat its notes as inputs, not unquestioned truth.
-- Do not publish an irreversible App Store / Play Store submission without explicit human approval.
+- CUA Driver may be used through Codex or Claude for runtime checks, Notion policy publishing, and draft store uploads.
+- Never publish a configured Notion parent page; create a dedicated policy child/page and expose only the intended policy content.
+- Draft store metadata/build uploads are allowed when configured, but do not submit for review, release to production, accept agreements, or create irreversible store identifiers.
 - GitHub release automation and build artifacts may be prepared automatically.
 
 ## Expected durable documents
@@ -75,24 +94,382 @@ fn agent_instructions(brief: &str) -> String {
 - docs/01-product.md
 - docs/02-design.md
 - docs/03-architecture.md
-- docs/04-qa.md
-- docs/05-store.md
-- docs/06-release.md
+- docs/04-quality.md
+- docs/05-qa.md
+- docs/06-store.md
+- docs/07-publish.md
+- docs/08-release.md
+- docs/policies/privacy-policy.md
+- docs/policies/terms.md
+- docs/policies/support-and-data-deletion.md
 "#,
     )
+}
+
+pub fn discover(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut projects = Vec::new();
+    if !root.exists() {
+        return Ok(projects);
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() && path.join(".appforge/project.conf").is_file() {
+            projects.push(path);
+        }
+    }
+    projects.sort();
+    Ok(projects)
 }
 
 pub fn load_brief(project: &Path) -> io::Result<String> {
     let text = fs::read_to_string(project.join(".appforge/project.conf"))?;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("brief=") {
-            return Ok(value.trim().to_string());
+            if !value.trim().is_empty() {
+                return Ok(value.trim().to_string());
+            }
         }
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         "missing brief in .appforge/project.conf",
     ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoreUploadRequest {
+    app_identifier: String,
+    allowed_actions: String,
+    artifacts: Vec<(String, String)>,
+}
+
+fn parse_store_upload_request(text: &str) -> io::Result<StoreUploadRequest> {
+    let mut app_identifier = None;
+    let mut allowed_actions = None;
+    let mut artifacts = Vec::new();
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line == "approved=false" {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("app_identifier=") {
+            let value = value.trim();
+            if value.is_empty() || value.chars().any(char::is_control) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid app_identifier in store upload request",
+                ));
+            }
+            app_identifier = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("allowed_actions=") {
+            let requested = value
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>();
+            let allowed = ["metadata", "policy_urls", "screenshots", "build_upload"];
+            if requested.is_empty() || requested.iter().any(|v| !allowed.contains(v)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "store upload request contains an unsupported action",
+                ));
+            }
+            allowed_actions = Some(requested.join(","));
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("artifact=") {
+            let Some((path, sha)) = value.split_once("|sha256=") else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "artifact entry must use artifact=<path>|sha256=<hex>",
+                ));
+            };
+            let path = path.trim();
+            let sha = sha.trim();
+            let artifact_path = Path::new(path);
+            if path.is_empty()
+                || artifact_path.is_absolute()
+                || artifact_path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+                || sha.len() != 64
+                || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid artifact path or SHA-256 in store upload request",
+                ));
+            }
+            artifacts.push((path.to_string(), sha.to_ascii_lowercase()));
+            continue;
+        }
+
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported store upload request field: {line}"),
+        ));
+    }
+
+    Ok(StoreUploadRequest {
+        app_identifier: app_identifier.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store upload request is missing app_identifier",
+            )
+        })?,
+        allowed_actions: allowed_actions.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store upload request is missing allowed_actions",
+            )
+        })?,
+        artifacts,
+    })
+}
+
+fn load_store_upload_request(project: &Path) -> io::Result<StoreUploadRequest> {
+    let text = fs::read_to_string(project.join(".appforge/store-upload-request.conf"))?;
+    let request = parse_store_upload_request(&text)?;
+    if (request
+        .allowed_actions
+        .split(',')
+        .any(|v| v == "build_upload")
+        || request
+            .allowed_actions
+            .split(',')
+            .any(|v| v == "screenshots"))
+        && request.artifacts.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "screenshot/build upload approval requires at least one hashed artifact",
+        ));
+    }
+    verify_store_artifacts(project, &request)?;
+    Ok(request)
+}
+
+fn verify_store_artifacts(project: &Path, request: &StoreUploadRequest) -> io::Result<()> {
+    let root = project.canonicalize()?;
+    for (relative, expected_sha) in &request.artifacts {
+        let artifact = project.join(relative).canonicalize().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("approved artifact {relative} cannot be resolved: {err}"),
+            )
+        })?;
+        if !artifact.starts_with(&root) || !artifact.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("approved artifact escapes project or is not a file: {relative}"),
+            ));
+        }
+        let actual_sha = file_sha256(&artifact)?;
+        if actual_sha != *expected_sha {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "artifact SHA-256 changed for {relative}: request={expected_sha} actual={actual_sha}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn file_sha256(path: &Path) -> io::Result<String> {
+    #[cfg(target_os = "windows")]
+    let output = Command::new("certutil")
+        .arg("-hashfile")
+        .arg(path)
+        .arg("SHA256")
+        .output()?;
+
+    #[cfg(target_os = "macos")]
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let output = Command::new("sha256sum").arg(path).output()?;
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SHA-256 verification is unsupported on this OS",
+    ));
+
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "SHA-256 tool failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace()
+        .map(|token| token.trim())
+        .find(|token| token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| io::Error::other("SHA-256 tool returned no 64-hex digest"))
+}
+
+fn single_line(value: &str) -> io::Result<&str> {
+    if value.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "approval value contains control characters",
+        ));
+    }
+    Ok(value)
+}
+
+pub fn approve_publish(project: &Path, cfg: &Config) -> io::Result<()> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::other(
+            "publish approval requires an interactive terminal",
+        ));
+    }
+    if !cfg.notion_enabled && !cfg.store_draft_upload {
+        return Err(io::Error::other(
+            "Notion publishing and store draft upload are both disabled",
+        ));
+    }
+
+    let store_request = if cfg.store_draft_upload {
+        Some(load_store_upload_request(project)?)
+    } else {
+        None
+    };
+
+    println!("\nAppForge external publish approval");
+    println!("==================================");
+    println!("Project: {}", project.display());
+    if cfg.notion_enabled {
+        println!(
+            "Notion: create/update app policy content under {} target {}",
+            cfg.notion_target_kind, cfg.notion_target_url
+        );
+        println!(
+            "Notion public publish: {}",
+            if cfg.notion_publish_public {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+    if let Some(request) = &store_request {
+        println!("Store app identifier: {}", request.app_identifier);
+        println!("Allowed draft actions: {}", request.allowed_actions);
+        if request.artifacts.is_empty() {
+            println!("Artifacts: none requested");
+        } else {
+            println!("Artifacts:");
+            for (path, sha) in &request.artifacts {
+                println!("  - {path}  sha256={sha}");
+            }
+        }
+    }
+    println!(
+        "Final review submission, production rollout, agreements, pricing, and account changes remain forbidden."
+    );
+    print!("Approve exactly these external actions for one publish attempt? [y/N]: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0
+        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    {
+        return Err(io::Error::other("publish approval was not granted"));
+    }
+
+    let mut approval = format!(
+        "approved=true\napproved_at={}\nnotion_enabled={}\nnotion_target_kind={}\nnotion_target_url={}\nnotion_publish_public={}\nstore_draft_upload={}\n",
+        epoch(),
+        cfg.notion_enabled,
+        single_line(&cfg.notion_target_kind)?,
+        single_line(&cfg.notion_target_url)?,
+        cfg.notion_publish_public,
+        cfg.store_draft_upload,
+    );
+    if let Some(request) = &store_request {
+        approval.push_str(&format!(
+            "app_identifier={}\nallowed_actions={}\n",
+            single_line(&request.app_identifier)?,
+            request.allowed_actions
+        ));
+        for (path, sha) in &request.artifacts {
+            approval.push_str(&format!("artifact={path}|sha256={sha}\n"));
+        }
+    }
+    fs::write(project.join(".appforge/publish-approved.conf"), approval)?;
+    println!("Approved for one publish attempt.");
+    Ok(())
+}
+
+pub fn validate_publish_approval(project: &Path, cfg: &Config) -> io::Result<()> {
+    let text = fs::read_to_string(project.join(".appforge/publish-approved.conf"))?;
+    let required = [
+        ("approved", "true".to_string()),
+        ("notion_enabled", cfg.notion_enabled.to_string()),
+        ("notion_target_kind", cfg.notion_target_kind.clone()),
+        ("notion_target_url", cfg.notion_target_url.clone()),
+        (
+            "notion_publish_public",
+            cfg.notion_publish_public.to_string(),
+        ),
+        ("store_draft_upload", cfg.store_draft_upload.to_string()),
+    ];
+    for (key, expected) in required {
+        let found = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")));
+        if found != Some(expected.as_str()) {
+            return Err(io::Error::other(format!(
+                "publish approval is missing or stale for {key}"
+            )));
+        }
+    }
+
+    if cfg.store_draft_upload {
+        let request = load_store_upload_request(project)?;
+        for expected in [
+            format!("app_identifier={}", request.app_identifier),
+            format!("allowed_actions={}", request.allowed_actions),
+        ] {
+            if !text.lines().any(|line| line == expected) {
+                return Err(io::Error::other(
+                    "publish approval does not match the current store request",
+                ));
+            }
+        }
+        for (path, sha) in request.artifacts {
+            let expected = format!("artifact={path}|sha256={sha}");
+            if !text.lines().any(|line| line == expected) {
+                return Err(io::Error::other(
+                    "publish approval does not match the current artifact request",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn consume_publish_approval(project: &Path) -> io::Result<()> {
+    match fs::remove_file(project.join(".appforge/publish-approved.conf")) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn mark_stage(project: &Path, stage: &str, ok: bool, note: &str) -> io::Result<()> {
@@ -121,14 +498,6 @@ fn display_name(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn unique_path(root: &Path, slug: &str) -> PathBuf {
-    let first = root.join(slug);
-    if !first.exists() {
-        return first;
-    }
-    root.join(format!("{slug}-{}", epoch()))
 }
 
 fn slugify(brief: &str) -> String {
@@ -176,5 +545,29 @@ mod tests {
     #[test]
     fn non_ascii_brief_gets_safe_fallback() {
         assert!(slugify("한국형 퍼즐 게임").starts_with("game-"));
+    }
+
+    #[test]
+    fn store_upload_request_rejects_path_traversal_and_unknown_actions() {
+        let traversal = parse_store_upload_request(
+            "app_identifier=android:com.example.game\nallowed_actions=build_upload\nartifact=../game.aab|sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\napproved=false\n",
+        );
+        assert!(traversal.is_err());
+
+        let unknown = parse_store_upload_request(
+            "app_identifier=android:com.example.game\nallowed_actions=metadata,production_release\napproved=false\n",
+        );
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn store_upload_request_parses_bounded_draft_actions() {
+        let request = parse_store_upload_request(
+            "app_identifier=android:com.example.game\nallowed_actions=metadata,policy_urls\napproved=false\n",
+        )
+        .unwrap();
+        assert_eq!(request.app_identifier, "android:com.example.game");
+        assert_eq!(request.allowed_actions, "metadata,policy_urls");
+        assert!(request.artifacts.is_empty());
     }
 }

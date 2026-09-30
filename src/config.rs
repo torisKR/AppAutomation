@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
+use crate::computer;
 use crate::provider;
 
 #[derive(Clone, Debug)]
@@ -14,6 +15,12 @@ pub struct Config {
     pub auto_mode: bool,
     pub aside_enabled: bool,
     pub strict_subscription_auth: bool,
+    pub notion_enabled: bool,
+    pub notion_target_kind: String,
+    pub notion_target_url: String,
+    pub notion_publish_public: bool,
+    pub computer_backend: String,
+    pub store_draft_upload: bool,
 }
 
 impl Default for Config {
@@ -27,6 +34,12 @@ impl Default for Config {
             auto_mode: true,
             aside_enabled: true,
             strict_subscription_auth: true,
+            notion_enabled: false,
+            notion_target_kind: "page".into(),
+            notion_target_url: String::new(),
+            notion_publish_public: false,
+            computer_backend: "auto".into(),
+            store_draft_upload: false,
         }
     }
 }
@@ -56,7 +69,7 @@ impl Config {
 
     pub fn serialize(&self) -> String {
         format!(
-            "primary={}\nsecondary={}\nenabled={}\nprojects_dir={}\nauto_mode={}\naside_enabled={}\nstrict_subscription_auth={}\n",
+            "primary={}\nsecondary={}\nenabled={}\nprojects_dir={}\nauto_mode={}\naside_enabled={}\nstrict_subscription_auth={}\nnotion_enabled={}\nnotion_target_kind={}\nnotion_target_url={}\nnotion_publish_public={}\ncomputer_backend={}\nstore_draft_upload={}\n",
             self.primary,
             self.secondary.join(","),
             self.enabled.join(","),
@@ -64,6 +77,12 @@ impl Config {
             self.auto_mode,
             self.aside_enabled,
             self.strict_subscription_auth,
+            self.notion_enabled,
+            self.notion_target_kind,
+            self.notion_target_url,
+            self.notion_publish_public,
+            self.computer_backend,
+            self.store_draft_upload,
         )
     }
 }
@@ -88,6 +107,16 @@ fn parse(text: &str) -> Config {
             "aside_enabled" => cfg.aside_enabled = parse_bool(value, cfg.aside_enabled),
             "strict_subscription_auth" => {
                 cfg.strict_subscription_auth = parse_bool(value, cfg.strict_subscription_auth)
+            }
+            "notion_enabled" => cfg.notion_enabled = parse_bool(value, cfg.notion_enabled),
+            "notion_target_kind" => cfg.notion_target_kind = value.to_string(),
+            "notion_target_url" => cfg.notion_target_url = value.to_string(),
+            "notion_publish_public" => {
+                cfg.notion_publish_public = parse_bool(value, cfg.notion_publish_public)
+            }
+            "computer_backend" => cfg.computer_backend = value.to_string(),
+            "store_draft_upload" => {
+                cfg.store_draft_upload = parse_bool(value, cfg.store_draft_upload)
             }
             _ => {}
         }
@@ -125,7 +154,12 @@ fn read_line(prompt: &str) -> io::Result<String> {
     print!("{prompt}");
     io::stdout().flush()?;
     let mut value = String::new();
-    io::stdin().read_line(&mut value)?;
+    if io::stdin().read_line(&mut value)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "setup input closed",
+        ));
+    }
     Ok(value.trim().to_string())
 }
 
@@ -162,7 +196,18 @@ fn selected_from_indices(raw: &str, installed: &[String]) -> Vec<String> {
     out
 }
 
+fn yes_explicit(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn yes_default(raw: &str) -> bool {
+    !matches!(raw.to_ascii_lowercase().as_str(), "n" | "no")
+}
+
 pub fn onboard() -> io::Result<Config> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::other("setup requires an interactive terminal"));
+    }
     println!("\nAppForge first-run setup");
     println!("========================");
     println!("각 AI CLI는 토큰을 추출하지 않고 공식 CLI 로그인 세션을 그대로 사용합니다.\n");
@@ -219,11 +264,71 @@ pub fn onboard() -> io::Result<Config> {
         expand_home(&dir_raw)
     };
 
-    let auto_raw = read_line("기본 자동 실행? [Y/n]: ")?;
-    let auto_mode = !matches!(auto_raw.to_ascii_lowercase().as_str(), "n" | "no");
+    let auto_mode = yes_default(&read_line("기본 자동 실행? [Y/n]: ")?);
+    let aside_enabled = yes_default(&read_line("Aside Browser lane 사용? [Y/n]: ")?);
 
-    let aside_raw = read_line("Aside Browser lane 사용? [Y/n]: ")?;
-    let aside_enabled = !matches!(aside_raw.to_ascii_lowercase().as_str(), "n" | "no");
+    println!("\n정책 문서 자동 배포");
+    println!("개인정보처리방침/이용약관/지원 문서를 Notion에 만들고 스토어 메타데이터에 공개 URL을 연결할 수 있습니다.");
+    let notion_enabled = yes_explicit(&read_line(
+        "Notion 정책 문서 자동 배포를 사용할까요? [y/N]: ",
+    )?);
+    let mut notion_target_kind = "page".to_string();
+    let mut notion_target_url = String::new();
+    let mut notion_publish_public = false;
+    if notion_enabled {
+        println!("  1. Notion 페이지 아래에 정책용 하위 페이지 생성");
+        println!("  2. Notion 데이터베이스에 앱별 정책 페이지 생성");
+        let kind = choose_index("저장 대상 [1]: ", 2, 0)?;
+        notion_target_kind = if kind == 1 { "database" } else { "page" }.into();
+        notion_target_url = read_line("Notion 대상 페이지/데이터베이스 URL: ")?;
+        if notion_target_url.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Notion 자동 배포를 사용하려면 대상 URL이 필요합니다.",
+            ));
+        }
+        notion_publish_public = yes_explicit(&read_line(
+            "notion.site 공개 링크까지 자동 게시할까요? [y/N]: ",
+        )?);
+    }
+
+    println!("\nComputer Use controller");
+    println!("  1. Auto (Primary가 Codex/Claude면 해당 구독 세션 + CUA Driver)");
+    println!("  2. Codex + CUA Driver");
+    println!("  3. Claude + CUA Driver");
+    let requested_backend = match choose_index("백엔드 [1]: ", 3, 0)? {
+        1 => "codex",
+        2 => "claude",
+        _ => "auto",
+    };
+    let computer_backend =
+        if requested_backend != "auto" && !enabled.iter().any(|id| id == requested_backend) {
+            println!(
+            "  선택한 {} provider가 활성화되어 있지 않아 Computer Use 백엔드는 Auto로 저장합니다.",
+            requested_backend
+        );
+            "auto".to_string()
+        } else {
+            requested_backend.to_string()
+        };
+
+    let store_draft_upload = yes_explicit(&read_line(
+        "Play Console / App Store Connect에 메타데이터·빌드를 Draft 상태까지 자동 업로드할까요? [y/N]: ",
+    )?);
+    if store_draft_upload {
+        println!("  최종 심사 제출/프로덕션 출시/약관 동의는 자동으로 누르지 않습니다.");
+    }
+
+    if (notion_enabled || store_draft_upload)
+        && !enabled
+            .iter()
+            .any(|id| matches!(id.as_str(), "codex" | "claude"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Computer Use 자동화를 사용하려면 Codex 또는 Claude를 enabled provider에 포함해야 합니다.",
+        ));
+    }
 
     let mut cfg = Config {
         primary,
@@ -233,6 +338,12 @@ pub fn onboard() -> io::Result<Config> {
         auto_mode,
         aside_enabled,
         strict_subscription_auth: true,
+        notion_enabled,
+        notion_target_kind,
+        notion_target_url,
+        notion_publish_public,
+        computer_backend,
+        store_draft_upload,
     };
 
     if cfg.enabled.iter().any(|id| id == "opencode") {
@@ -242,13 +353,35 @@ pub fn onboard() -> io::Result<Config> {
         cfg.strict_subscription_auth = true;
     }
 
+    if cfg.notion_enabled || cfg.store_draft_upload {
+        let status = computer::status();
+        println!("\nComputer Use: {}", status.summary());
+        if !status.cua_installed {
+            let install = yes_default(&read_line(
+                "CUA Driver가 없습니다. 공식 설치 스크립트로 설치할까요? [Y/n]: ",
+            )?);
+            if install {
+                computer::install_cua()?;
+            }
+        }
+        let status = computer::status();
+        if status.cua_installed && !status.permissions_ready {
+            let grant = yes_default(&read_line(
+                "CUA Driver의 Accessibility/Screen Recording 권한을 설정할까요? [Y/n]: ",
+            )?);
+            if grant {
+                computer::grant_permissions()?;
+            }
+        }
+    }
+
     fs::create_dir_all(&cfg.projects_dir)?;
     cfg.save()?;
     println!("\n설정 저장: {}", config_path().display());
 
     let login_now =
         read_line("선택한 provider 로그인 상태를 확인하고 필요한 로그인을 실행할까요? [Y/n]: ")?;
-    if !matches!(login_now.to_ascii_lowercase().as_str(), "n" | "no") {
+    if yes_default(&login_now) {
         for id in &cfg.enabled {
             match provider::auth_status(id) {
                 provider::AuthState::Authenticated(note) => {
@@ -261,7 +394,7 @@ pub fn onboard() -> io::Result<Config> {
                 provider::AuthState::NeedsLogin(note) => {
                     println!("\n{} 로그인 필요: {}", provider::label(id), note);
                     let answer = read_line("  지금 로그인 실행? [Y/n]: ")?;
-                    if !matches!(answer.to_ascii_lowercase().as_str(), "n" | "no") {
+                    if yes_default(&answer) {
                         let _ = provider::login(id);
                     }
                 }
@@ -285,6 +418,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_config_keeps_external_actions_disabled() {
+        let cfg = parse("primary=claude\nsecondary=codex\nenabled=claude,codex\n");
+        assert_eq!(cfg.primary, "claude");
+        assert!(!cfg.notion_enabled && !cfg.store_draft_upload && !cfg.notion_publish_public);
+        assert!(cfg.strict_subscription_auth);
+        assert!(!yes_explicit(""));
+    }
+
+    #[test]
     fn config_round_trip_core_fields() {
         let cfg = Config {
             primary: "claude".into(),
@@ -294,6 +436,12 @@ mod tests {
             auto_mode: false,
             aside_enabled: true,
             strict_subscription_auth: true,
+            notion_enabled: true,
+            notion_target_kind: "database".into(),
+            notion_target_url: "https://notion.so/example".into(),
+            notion_publish_public: true,
+            computer_backend: "codex".into(),
+            store_draft_upload: true,
         };
         let parsed = parse(&cfg.serialize());
         assert_eq!(parsed.primary, "claude");
@@ -301,5 +449,10 @@ mod tests {
         assert_eq!(parsed.projects_dir, PathBuf::from("/tmp/games"));
         assert!(!parsed.auto_mode);
         assert!(parsed.aside_enabled);
+        assert!(parsed.notion_enabled);
+        assert_eq!(parsed.notion_target_kind, "database");
+        assert_eq!(parsed.notion_target_url, "https://notion.so/example");
+        assert_eq!(parsed.computer_backend, "codex");
+        assert!(parsed.store_draft_upload);
     }
 }

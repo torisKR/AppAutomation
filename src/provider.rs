@@ -1,9 +1,10 @@
 use std::env;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct ProviderInfo {
@@ -60,13 +61,34 @@ fn candidates(id: &str) -> &'static [&'static str] {
     }
 }
 
-fn find_binary(id: &str) -> Option<PathBuf> {
+pub(crate) fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+pub(crate) fn find_binary(id: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
         for name in candidates(id) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            let candidate = dir.join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            });
+            if is_executable(&candidate) {
+                return candidate.canonicalize().ok();
             }
         }
     }
@@ -97,29 +119,80 @@ pub fn detected() -> Vec<ProviderInfo> {
         .collect()
 }
 
+// Diagnostics must not indefinitely stall doctor, setup, or stage routing.
+pub(crate) fn probe_output(mut command: Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr"))?;
+    let read = |stream: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut data = Vec::new();
+            stream.take(64 * 1024).read_to_end(&mut data).map(|_| data)
+        })
+    };
+    let out = read(Box::new(stdout));
+    let err = read(Box::new(stderr));
+    let start = Instant::now();
+    loop {
+        let status = child.try_wait()?;
+        if let Some(status) = status {
+            if out.is_finished() && err.is_finished() {
+                let stdout = out
+                    .join()
+                    .map_err(|_| io::Error::other("probe reader panicked"))??;
+                let stderr = err
+                    .join()
+                    .map_err(|_| io::Error::other("probe reader panicked"))??;
+                return Ok((status, stdout, stderr));
+            }
+        }
+        if start.elapsed() >= Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "CLI status probe timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn output_status(binary: &Path, args: &[&str]) -> io::Result<(bool, String)> {
     let mut command = Command::new(binary);
     // Status checks use the same subscription-first environment as task runs.
     let id = ids()
         .iter()
         .find(|id| {
-            candidates(id)
-                .iter()
-                .any(|name| binary.file_name().is_some_and(|file| file == *name))
+            candidates(id).iter().any(|name| {
+                binary.file_name().is_some_and(|file| file == *name)
+                    || binary.file_stem().is_some_and(|file| file == *name)
+            })
         })
         .copied()
         .unwrap_or("");
     subscription_environment(&mut command, id);
-    let output = command.args(args).stdin(Stdio::null()).output()?;
-    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    command.args(args);
+    let (status, stdout, stderr) = probe_output(command)?;
+    let mut text = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
     if !stderr.is_empty() {
         if !text.is_empty() {
             text.push_str(" · ");
         }
         text.push_str(&stderr);
     }
-    Ok((output.status.success(), compact(&text, 120)))
+    Ok((status.success(), compact(&text, 120)))
 }
 
 pub fn auth_status(id: &str) -> AuthState {
@@ -205,7 +278,7 @@ fn compact(value: &str, max: usize) -> String {
         + "…"
 }
 
-fn subscription_environment(cmd: &mut Command, id: &str) {
+pub(crate) fn subscription_environment(cmd: &mut Command, id: &str) {
     let removed: &[&str] = match id {
         "codex" => &["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],
         "claude" => &[

@@ -17,6 +17,8 @@ The integration boundary is the provider's official CLI.
 
 Goal: use the ChatGPT-authenticated Codex CLI session rather than an ambient API key.
 
+For computer-use tasks, AppForge supplies ephemeral Codex config overrides for `mcp_servers.computer.command="cua-driver"` and `args=["mcp"]`. It does not write this server into the user's global Codex config.
+
 ## Claude Code
 
 - binary: claude
@@ -26,6 +28,8 @@ Goal: use the ChatGPT-authenticated Codex CLI session rather than an ambient API
 - child environment removes ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN
 
 This matters because Claude Code can otherwise prefer an API key and bill API usage instead of subscription allocation.
+
+For computer-use tasks, AppForge supplies an ephemeral `--mcp-config` containing `cua-driver mcp`. It does not add a persistent Claude MCP server.
 
 ## Cursor
 

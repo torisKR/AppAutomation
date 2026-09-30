@@ -1,4 +1,5 @@
 mod aside;
+mod computer;
 mod config;
 mod orchestrator;
 mod project;
@@ -43,6 +44,17 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         "doctor" => doctor(),
+        "computer" => match args.get(1).map(String::as_str).unwrap_or("status") {
+            "status" => {
+                println!("{}", computer::status().summary());
+                Ok(())
+            }
+            "setup" => computer::setup_interactive(),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown computer command: {other}. Use status or setup."),
+            )),
+        },
         "providers" => {
             println!(
                 "{:<12} {:<5} {:<18} {:<36} BINARY",
@@ -97,6 +109,67 @@ fn run() -> io::Result<()> {
             let brief = project::load_brief(&path)?;
             orchestrator::run_all(cfg, path, brief)
         }
+        "repair" => {
+            let cfg = config::ensure()?;
+            let path = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or(env::current_dir()?);
+            let brief = project::load_brief(&path)?;
+            println!("repair: {}", path.display());
+            orchestrator::run_repair(cfg, path, brief)
+        }
+        "approve-publish" => {
+            let cfg = config::ensure()?;
+            let path = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or(env::current_dir()?);
+            let _ = project::load_brief(&path)?;
+            project::approve_publish(&path, &cfg)
+        }
+        "publish" => {
+            let cfg = config::ensure()?;
+            let path = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or(env::current_dir()?);
+            let brief = project::load_brief(&path)?;
+            println!("publish: {}", path.display());
+            orchestrator::run_publish(cfg, path, brief)
+        }
+        "repair-all" => {
+            let cfg = config::ensure()?;
+            let root = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cfg.projects_dir.clone());
+            let projects = project::discover(&root)?;
+            if projects.is_empty() {
+                println!("No AppForge projects found under {}", root.display());
+                return Ok(());
+            }
+            println!("Found {} AppForge project(s).", projects.len());
+            let mut failures = Vec::new();
+            for path in projects {
+                let brief = match project::load_brief(&path) {
+                    Ok(brief) => brief,
+                    Err(err) => {
+                        failures.push(format!("{}: {err}", path.display()));
+                        continue;
+                    }
+                };
+                println!("\n=== repair {} ===", path.display());
+                if let Err(err) = orchestrator::run_repair(cfg.clone(), path.clone(), brief) {
+                    failures.push(format!("{}: {err}", path.display()));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(failures.join("\n")))
+            }
+        }
         "config" => {
             println!("{}", config::config_path().display());
             Ok(())
@@ -127,6 +200,16 @@ fn doctor() -> io::Result<()> {
             println!("auto: {}", cfg.auto_mode);
             println!("aside: {}", cfg.aside_enabled);
             println!("strict subscription auth: {}", cfg.strict_subscription_auth);
+            println!("notion policy publish: {}", cfg.notion_enabled);
+            if cfg.notion_enabled {
+                println!(
+                    "notion target: {} {}",
+                    cfg.notion_target_kind, cfg.notion_target_url
+                );
+                println!("notion public link: {}", cfg.notion_publish_public);
+            }
+            println!("computer backend: {}", cfg.computer_backend);
+            println!("store draft upload: {}", cfg.store_draft_upload);
         }
         Err(err) => println!("config status: {err}"),
     }
@@ -134,6 +217,7 @@ fn doctor() -> io::Result<()> {
         "aside binary: {}",
         if aside::available() { "yes" } else { "no" }
     );
+    println!("computer use: {}", computer::status().summary());
     println!();
     println!(
         "{:<12} {:<5} {:<18} {:<36} BINARY",
@@ -152,12 +236,19 @@ fn print_help() {
 USAGE
   appforge                     Open the split-screen TUI
   appforge setup               Run first-run provider/project setup
-  appforge doctor              Check CLIs, auth, Aside, and config
+  appforge doctor              Check CLIs, auth, Aside, CUA, Notion/store config
+  appforge computer status     Check CUA Driver/controller readiness
+  appforge computer setup      Install/configure CUA Driver when needed
   appforge providers           List supported provider status
   appforge login <provider>    Run the provider's official login flow
   appforge create <brief>      Create a generated app workspace only
   appforge new <brief>         Create a workspace and run the full pipeline
   appforge run [project-dir]   Resume/run all stages for an existing workspace
+  appforge repair [project]    Find/fix functional and performance weaknesses
+  appforge repair-all [root]   Repair every generated AppForge project under a root
+  appforge approve-publish [project]
+                               Review/approve one Notion/store draft publish attempt
+  appforge publish [project]   Run approved Notion/store draft upload then release gate
   appforge config              Print config path
   appforge version             Print version
 
@@ -170,7 +261,8 @@ TUI COMMANDS
   quit         Exit when no worker is active
 
 PIPELINE
-  Product plan → Design → Development → QA → Store readiness → Release
+  Plan → Design → Development → Functional/performance repair → QA
+  → Store/policies → Notion/store draft upload → Release
 
 AUTH POLICY
   Codex, Claude Code, Cursor, and Antigravity are invoked through their official
