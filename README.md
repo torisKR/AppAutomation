@@ -154,9 +154,10 @@ The workflow publishes:
 
 No second repository or PAT secret is required. After a tag release succeeds, the release workflow writes the checksummed formula back to `Formula/appforge.rb` on this repository's `main` branch.
 
-Install this repository as an explicit-URL tap:
+Install this repository as an explicit-URL tap. Current Homebrew versions require a one-time trust grant for non-official tap formulae, so trust only AppForge rather than the whole tap:
 
     brew tap torisKR/appautomation https://github.com/torisKR/AppAutomation.git
+    brew trust --formula torisKR/appautomation/appforge
     brew install appforge
 
 Upgrade:
