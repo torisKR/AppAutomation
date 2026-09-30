@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# Serialize releases so concurrent tags cannot race while updating the tap.
+concurrency:
+  group: appforge-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: appforge_Darwin_arm64
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: appforge_Darwin_x86_64
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: appforge_Linux_x86_64
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: appforge_Windows_x86_64
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt
+
+      - name: Validate tag against Cargo version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 > metadata.json
+          python - <<'PY'
+          import json, os
+          with open("metadata.json") as source:
+              version = json.load(source)["packages"][0]["version"]
+          expected = "v" + version
+          if os.environ["RELEASE_TAG"] != expected:
+              raise SystemExit(f"Release tag must match Cargo.toml: {expected}")
+          PY
+
+      - name: Check formatting and test
+        run: |
+          cargo fmt --check
+          cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/appforge" dist/appforge
+          cp LICENSE README.md dist/
+          tar -C dist -czf "${{ matrix.asset }}.tar.gz" appforge LICENSE README.md
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/appforge.exe" "dist/appforge.exe"
+          Copy-Item LICENSE, README.md dist/
+          Compress-Archive -Path "dist/*" -DestinationPath "${{ matrix.asset }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets and calculate checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          assets=(appforge_Darwin_arm64.tar.gz appforge_Darwin_x86_64.tar.gz appforge_Linux_x86_64.tar.gz appforge_Windows_x86_64.zip)
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          sha256sum "${assets[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          # Upload to a draft so a failed upload never exposes a partial release.
+          # Refuse to overwrite an already published release on a full rerun.
+          if gh release view "$RELEASE_TAG" --repo "$SOURCE_REPO" --json isDraft > release.json; then
+            python - <<'PY'
+          import json
+          with open("release.json") as source:
+              if not json.load(source)["isDraft"]:
+                  raise SystemExit("Release already published; rerun only the failed jobs.")
+          PY
+          else
+            options=()
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              options+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" --repo "$SOURCE_REPO" \
+              --draft --generate-notes --verify-tag "${options[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --repo "$SOURCE_REPO" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$SOURCE_REPO" --draft=false
+
+  homebrew:
+    needs: publish
+    if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' && !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify tap configuration
+        shell: bash
+        env:
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          test -n "$TAP_TOKEN" || { echo 'HOMEBREW_TAP_TOKEN is required for the configured tap'; exit 1; }
+          [[ "$TAP_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+
+      - name: Download release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          mkdir release
+          gh release download "$RELEASE_TAG" --repo "$SOURCE_REPO" \
+            --dir release --pattern 'appforge_Darwin_*.tar.gz' --pattern SHA256SUMS
+          cd release
+          sha256sum --check --ignore-missing SHA256SUMS
+
+      - name: Calculate checksums
+        id: sums
+        shell: bash
+        run: |
+          echo "arm64=$(sha256sum release/appforge_Darwin_arm64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "x64=$(sha256sum release/appforge_Darwin_x86_64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update Homebrew formula
+        shell: bash
+        env:
+          ARM64_SHA: ${{ steps.sums.outputs.arm64 }}
+          X64_SHA: ${{ steps.sums.outputs.x64 }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p tap/Formula
+          VERSION="${RELEASE_TAG#v}"
+          cat > tap/Formula/appforge.rb <<RUBY
+          class Appforge < Formula
+            desc "Subscription-first multi-agent app factory"
+            homepage "https://github.com/${SOURCE_REPO}"
+            version "${VERSION}"
+            license "MIT"
+            depends_on :macos
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/${SOURCE_REPO}/releases/download/${RELEASE_TAG}/appforge_Darwin_arm64.tar.gz"
+                sha256 "${ARM64_SHA}"
+              else
+                url "https://github.com/${SOURCE_REPO}/releases/download/${RELEASE_TAG}/appforge_Darwin_x86_64.tar.gz"
+                sha256 "${X64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "appforge"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/appforge version")
+            end
+          end
+          RUBY
+          ruby -c tap/Formula/appforge.rb
+
+      - name: Push formula
+        working-directory: tap
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name "appforge-release"
+          git config user.email "appforge-release@users.noreply.github.com"
+          git add Formula/appforge.rb
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "appforge $RELEASE_TAG"
+          git push
