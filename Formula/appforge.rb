@@ -1,22 +1,23 @@
 class Appforge < Formula
   desc "Subscription-first multi-agent app factory"
   homepage "https://github.com/torisKR/AppAutomation"
-  version "0.1.0"
+  version "0.2.2"
   license "MIT"
+
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/torisKR/AppAutomation/releases/download/v0.1.0/appforge_Darwin_arm64.tar.gz"
-      sha256 "1e2308d9b58ede01f2088b1f197c86ec52f91ecc938d2b5734de6a4f0c523810"
+      url "https://github.com/torisKR/AppAutomation/releases/download/v0.2.2/appforge_Darwin_arm64.tar.gz"
+      sha256 "a4d6e55c8075a4cb764943f393d8989051e67b80333a4db6d071b3c647614cac"
     else
-      url "https://github.com/torisKR/AppAutomation/releases/download/v0.1.0/appforge_Darwin_x86_64.tar.gz"
-      sha256 "f6da845d0d79b9a5b4b7bf9b7b68239e876c95e6409b10fabe88d856e073901b"
+      url "https://github.com/torisKR/AppAutomation/releases/download/v0.2.2/appforge_Darwin_x86_64.tar.gz"
+      sha256 "8bac39de594177fe3a844c33e78c7121ade82e014afb4af2a951fab4bc81e7be"
     end
   end
 
   on_linux do
     depends_on arch: :x86_64
-    url "https://github.com/torisKR/AppAutomation/releases/download/v0.1.0/appforge_Linux_x86_64.tar.gz"
-    sha256 "7f87bd153f1be0ac400e0db1bd2741f35903c57afcabb88db9938f017fb7e7e0"
+    url "https://github.com/torisKR/AppAutomation/releases/download/v0.2.2/appforge_Linux_x86_64.tar.gz"
+    sha256 "441018bedcbbe79cc0ce5e62679f47934277d707bcfb20bcea5949cc280a9628"
   end
 
   def install
