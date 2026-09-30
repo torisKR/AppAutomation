@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-09-30
+
+### Fixed
+
+- Windows CI now passes clippy with `-D warnings` by scoping the terminal `Write` import to Unix and avoiding a unit-value SIGINT guard binding on non-Unix platforms.
+- Release verification now covers the same cross-platform lint path that previously failed only on GitHub-hosted Windows runners.
+
 ## 0.2.1 — 2026-09-30
 
 ### Fixed

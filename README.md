@@ -186,8 +186,8 @@ Two workflows are included:
 
 Create a release (the tag must match `Cargo.toml`):
 
-    git tag v0.2.1
-    git push origin v0.2.1
+    git tag v0.2.2
+    git push origin v0.2.2
 
 The workflow publishes:
 

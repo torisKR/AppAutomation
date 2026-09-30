@@ -111,7 +111,10 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
 
     MANUAL_REQUESTED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
     let _signal = install_sigint_handler()?;
+    #[cfg(not(unix))]
+    install_sigint_handler()?;
     let terminal = terminal::Session::enter()?;
     let (input_tx, input_rx) = mpsc::channel();
     spawn_command_reader(input_tx.clone(), terminal.mouse_enabled());

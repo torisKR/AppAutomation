@@ -1,6 +1,8 @@
 //! Small, dependency-free Unix terminal adapter. Keep ISIG enabled so Ctrl+C
 //! continues to reach AppForge and any active CLI in the terminal process group.
-use std::io::{self, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 
