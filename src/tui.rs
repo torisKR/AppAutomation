@@ -72,6 +72,7 @@ struct State {
     logs: VecDeque<String>,
     last_error: Option<String>,
     providers: Vec<provider::ProviderInfo>,
+    restart_from_stage: Option<usize>,
 }
 
 impl State {
@@ -88,6 +89,7 @@ impl State {
             logs: VecDeque::with_capacity(300),
             last_error: None,
             providers: Vec::new(),
+            restart_from_stage: None,
         }
     }
 
@@ -250,10 +252,23 @@ fn handle_command(
         _ => {
             if state.project.is_none() || state.complete() {
                 create_project(state, trimmed)?;
-            } else {
-                state.push_log(format!(
-                    "Unknown command while project is active: {trimmed}"
-                ));
+            } else if let Some(project_path) = state.project.clone() {
+                project::update_brief(&project_path, trimmed)?;
+                state.brief = trimmed.to_string();
+                state.last_error = None;
+                state.steps.fill(StepState::Pending);
+                if state.running {
+                    state.restart_from_stage = Some(0);
+                    state.push_log(
+                        "Product brief updated while a worker is active. The current worker will finish, then the pipeline will restart from Product plan with the new brief.",
+                    );
+                } else {
+                    state.stage_index = 0;
+                    state.restart_from_stage = None;
+                    state.push_log(
+                        "Product brief updated. The pipeline was reset to Product plan; press Run or Auto to continue.",
+                    );
+                }
             }
         }
     }
@@ -322,6 +337,15 @@ fn drain_worker_events(state: &mut State, rx: &Receiver<WorkerEvent>) {
                     .iter()
                     .position(|s| *s == stage)
                     .unwrap_or(state.stage_index);
+                if let Some(restart) = state.restart_from_stage.take() {
+                    state.steps.fill(StepState::Pending);
+                    state.stage_index = restart;
+                    state.last_error = None;
+                    state.push_log(
+                        "Previous worker result discarded because the product brief changed. Restarting from Product plan.",
+                    );
+                    continue;
+                }
                 match result {
                     Ok(()) => {
                         if idx < state.steps.len() {

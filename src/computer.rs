@@ -347,33 +347,44 @@ pub fn controller(cfg: &Config) -> Option<String> {
     }
 }
 
-fn codex_command(binary: &Path, cwd: &Path, prompt: &str, auto: bool) -> Command {
+fn codex_command(binary: &Path, cwd: &Path, prompt: &str, _auto: bool) -> Command {
     let mut cmd = Command::new(binary);
     let driver = driver_binary().unwrap_or_else(|| PathBuf::from("cua-driver"));
-    cmd.args([
-        "-c",
-        &format!(
-            "mcp_servers.computer.command={:?}",
-            driver.to_string_lossy()
-        ),
-    ]);
-    cmd.arg("exec");
-    if auto {
-        cmd.arg("--approve-for-me");
-    } else {
-        cmd.args(["-c", "approval_policy=\"never\""]);
-    }
+    cmd.args(["exec", "-m", "gpt-5.6-sol"]);
+    // Computer-use is already bounded by AppForge's explicit task contract,
+    // the CUA Driver standard permission mode, and (for external writes) the
+    // one-attempt approve-publish gate. Codex needs its automatic reviewer to
+    // authorize GUI tool calls such as launch_app/click. On current Codex,
+    // --approve-for-me already selects workspace-write sandboxing and cannot be
+    // combined with an explicit --sandbox flag.
+    cmd.arg("--approve-for-me");
     cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .args([
             "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--disable",
+            "plugins",
+            "--disable",
+            "apps",
+            "--disable",
+            "skill_search",
+            "--enable",
+            "skip_host_skill_discovery",
             "--json",
-            "--sandbox",
-            "workspace-write",
             "-c",
             "forced_login_method=\"chatgpt\"",
             "-c",
             "model_provider=\"openai\"",
+            "-c",
+            "model_reasoning_effort=\"medium\"",
+            "-c",
+            "suppress_unstable_features_warning=true",
+            "-c",
+            &format!(
+                "mcp_servers.computer.command={:?}",
+                driver.to_string_lossy()
+            ),
             "-c",
             "mcp_servers.computer.args=[\"mcp\"]",
             "-C",
@@ -415,7 +426,12 @@ fn claude_command(binary: &Path, cwd: &Path, prompt: &str, auto: bool) -> Comman
     cmd
 }
 
-fn stream_command(mut cmd: Command, label: &str, tx: Sender<String>) -> io::Result<()> {
+fn stream_command(
+    mut cmd: Command,
+    label: &str,
+    tx: Sender<String>,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -438,7 +454,24 @@ fn stream_command(mut cmd: Command, label: &str, tx: Sender<String>) -> io::Resu
         }
     });
 
-    let status = child.wait()?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out.join();
+            let _ = err.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{label} computer task exceeded its time limit"),
+            ));
+        }
+        thread::sleep(std::time::Duration::from_millis(250));
+    };
+
     let _ = out.join();
     let _ = err.join();
 
@@ -484,6 +517,7 @@ pub fn run_agent_task(
     let cwd = cwd.canonicalize()?;
     let safety = r#"
 COMPUTER-USE CONTRACT:
+- This AppForge task is self-contained. Do not inspect or invoke unrelated global skills, gstack, ~/.agents, ~/.claude, or ~/.codex instruction frameworks; use only this project's AGENTS.md, project files, the supplied task, and the computer MCP.
 - Use only the exact Notion/store resources named in this task. Runtime quality checks grant NO Notion/store write authority. Never change account settings, global MCP settings, pricing, sharing of existing resources, or legal agreements.
 - Use the CUA Driver MCP 'computer' server for browser/native GUI interaction.
 - Never inspect or copy passwords, MFA secrets, cookies, OAuth tokens, keychains, or unrelated tabs.
@@ -504,7 +538,62 @@ COMPUTER-USE CONTRACT:
         "claude" => claude_command(&binary, &cwd, &full_prompt, cfg.auto_mode),
         _ => unreachable!(),
     };
-    stream_command(command, provider::label(&controller), tx)?;
+    stream_command(command, provider::label(&controller), tx, None)?;
+    Ok(controller)
+}
+
+pub fn run_agent_task_bounded(
+    cfg: &Config,
+    cwd: &Path,
+    prompt: &str,
+    tx: Sender<String>,
+    timeout: std::time::Duration,
+) -> io::Result<String> {
+    if has_binary("cua-driver") && !daemon_is_running() {
+        start_daemon()?;
+    }
+    let current = status();
+    if !current.ready() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Computer Use is not ready: {}. Run appforge computer setup.",
+                current.summary()
+            ),
+        ));
+    }
+
+    let controller = controller(cfg).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "No enabled Codex/Claude controller is available for Computer Use",
+        )
+    })?;
+    let binary = provider::find_binary(&controller)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "controller CLI missing"))?;
+    let cwd = cwd.canonicalize()?;
+    let full_prompt = format!(
+        "{}\n\nTASK:\n{}",
+        r#"COMPUTER-USE CONTRACT:
+- This is a bounded smoke-test task. Use only this project and the computer MCP.
+- Do not inspect credentials, unrelated tabs, global skills, or account settings.
+- Do not publish, upload, purchase, submit, or accept agreements.
+- Do not modify application source code. Record observations only.
+- Stop quickly if a simulator/browser target cannot be launched with existing project tooling.
+- Write the requested durable result file before exiting."#,
+        prompt
+    );
+
+    let _ = tx.send(format!(
+        "{} + CUA Driver ▶ bounded UI smoke test",
+        provider::label(&controller)
+    ));
+    let command = match controller.as_str() {
+        "codex" => codex_command(&binary, &cwd, &full_prompt, false),
+        "claude" => claude_command(&binary, &cwd, &full_prompt, false),
+        _ => unreachable!(),
+    };
+    stream_command(command, provider::label(&controller), tx, Some(timeout))?;
     Ok(controller)
 }
 
@@ -600,6 +689,12 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg.contains("mcp_servers.computer.command")));
+        assert!(args.iter().any(|arg| arg == "gpt-5.6-sol"));
+        assert!(args.iter().any(|arg| arg == "--skip-git-repo-check"));
+        assert!(args.iter().any(|arg| arg == "skip_host_skill_discovery"));
+        assert!(args.iter().any(|arg| arg == "--approve-for-me"));
+        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+        assert!(!args.iter().any(|arg| arg == "approval_policy=\"never\""));
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 — 2026-10-01
+
+### Added
+
+- End-to-end loop-engineering hardening against real generated-app failures.
+- Stage locks, bounded worker timeouts, resumable completed stages, and source fingerprints for reusable Quality/QA checkpoints.
+- Three-pass development execution so scaffold/game loop, UI/persistence, and verification are completed in focused passes.
+- Host-native Expo verification now builds Android release artifacts and iOS Release simulator binaries outside the AI sandbox.
+- Automatic Android SDK discovery via ANDROID_HOME/ANDROID_SDK_ROOT plus standard platform locations.
+- Bounded CUA UI smoke checks and durable UI evidence files.
+- TUI product-brief replacement while a project is active; changed briefs invalidate prior stage evidence and restart from Product plan.
+- Aside research result caching and cleaner extraction of actionable research notes.
+
+### Fixed
+
+- Codex no longer combines `--approve-for-me` with an explicit `--sandbox` in ordinary provider execution, fixing the exit-status-2 failure reproduced in the TUI.
+- Codex tasks now use `--skip-git-repo-check` once, avoiding failures in freshly initialized or non-standard workspaces without duplicating the flag.
+- Android native host verification now supplies the detected SDK path, fixing `SDK location not found` during Gradle release assembly.
+- Release completion now requires `.appforge/release-decision=PASS` plus a nonempty `docs/08-release.md`; a BLOCKED release can no longer be recorded as `stage-release.status=done`.
+- Legacy projects with a stale `release=done` status but no PASS decision automatically rerun the Release gate.
+
+### Verified
+
+- Pocket Flow was generated through Product, Design, Development, Quality, QA, Store, Publish, and Release gating.
+- Android release APK was produced successfully and iOS Release simulator build completed with `BUILD SUCCEEDED`.
+- The iOS Release app was installed and launched successfully on an iPhone 17 Pro simulator as `com.appforge.pocketflow`.
+- AppForge itself passes 32 Rust tests, clippy with `-D warnings`, and release compilation after these fixes.
+
 ## 0.2.2 — 2026-09-30
 
 ### Fixed

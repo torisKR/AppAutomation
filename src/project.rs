@@ -106,6 +106,91 @@ fn agent_instructions(brief: &str) -> String {
     )
 }
 
+#[derive(Debug)]
+pub struct StageLock {
+    path: PathBuf,
+}
+
+impl Drop for StageLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub fn acquire_stage_lock(project: &Path, stage: &str) -> io::Result<StageLock> {
+    let dir = project.join(".appforge");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("stage.lock");
+
+    for _ in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                writeln!(file, "stage={stage}")?;
+                writeln!(file, "started_at={}", epoch())?;
+                return Ok(StageLock { path });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let current = fs::read_to_string(&path).unwrap_or_default();
+                let pid = current
+                    .lines()
+                    .find_map(|line| line.strip_prefix("pid="))
+                    .and_then(|value| value.parse::<u32>().ok());
+                if pid.is_some_and(process_alive) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "another AppForge stage is already running for this project ({})",
+                            current.lines().collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
+                }
+                fs::remove_file(&path)?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::other("could not acquire AppForge stage lock"))
+}
+
 pub fn discover(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut projects = Vec::new();
     if !root.exists() {
@@ -135,6 +220,89 @@ pub fn load_brief(project: &Path) -> io::Result<String> {
         io::ErrorKind::InvalidData,
         "missing brief in .appforge/project.conf",
     ))
+}
+
+pub fn update_brief(project: &Path, brief: &str) -> io::Result<()> {
+    let brief = brief.trim();
+    if brief.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "product brief cannot be empty",
+        ));
+    }
+
+    let conf_path = project.join(".appforge/project.conf");
+    let current = fs::read_to_string(&conf_path)?;
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in current.lines() {
+        if line.starts_with("brief=") {
+            lines.push(format!("brief={}", brief.replace(['\n', '\r'], " ")));
+            found = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        lines.insert(0, format!("brief={}", brief.replace(['\n', '\r'], " ")));
+    }
+    fs::write(conf_path, format!("{}\n", lines.join("\n")))?;
+
+    fs::write(project.join("AGENTS.md"), agent_instructions(brief))?;
+
+    let readme_path = project.join("README.md");
+    if let Ok(readme) = fs::read_to_string(&readme_path) {
+        const START: &str = "## Product brief\n\n";
+        const END: &str = "\n\n## Workflow";
+        if let Some(start) = readme.find(START) {
+            let content_start = start + START.len();
+            if let Some(relative_end) = readme[content_start..].find(END) {
+                let content_end = content_start + relative_end;
+                let mut updated = String::with_capacity(readme.len() + brief.len());
+                updated.push_str(&readme[..content_start]);
+                updated.push_str(brief);
+                updated.push_str(&readme[content_end..]);
+                fs::write(readme_path, updated)?;
+            }
+        }
+    }
+
+    // A changed brief invalidates browser research and every downstream stage result.
+    let aside_dir = project.join("docs/aside");
+    if let Ok(entries) = fs::read_dir(&aside_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let appforge_dir = project.join(".appforge");
+    if let Ok(entries) = fs::read_dir(&appforge_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("stage-")
+                || matches!(
+                    name.as_ref(),
+                    "quality-decision"
+                        | "qa-decision"
+                        | "release-decision"
+                        | "publish-approved.conf"
+                        | "store-upload-request.conf"
+                        | "policy-links.conf"
+                )
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,6 +640,16 @@ pub fn consume_publish_approval(project: &Path) -> io::Result<()> {
     }
 }
 
+pub fn stage_done(project: &Path, stage: &str) -> bool {
+    fs::read_to_string(
+        project
+            .join(".appforge")
+            .join(format!("stage-{stage}.status")),
+    )
+    .map(|text| text.lines().any(|line| line.trim() == "status=done"))
+    .unwrap_or(false)
+}
+
 pub fn mark_stage(project: &Path, stage: &str, ok: bool, note: &str) -> io::Result<()> {
     let dir = project.join(".appforge");
     fs::create_dir_all(&dir)?;
@@ -545,6 +723,43 @@ mod tests {
     #[test]
     fn non_ascii_brief_gets_safe_fallback() {
         assert!(slugify("한국형 퍼즐 게임").starts_with("game-"));
+    }
+
+    #[test]
+    fn update_brief_rewrites_agent_and_project_sources() {
+        let root = std::env::temp_dir().join(format!("appforge-brief-test-{}", epoch()));
+        let project = create(&root, "old brief").unwrap();
+        update_brief(
+            &project,
+            "미국 시장용 2D 퍼즐 게임. 한 손 조작과 Daily Puzzle을 포함한다.",
+        )
+        .unwrap();
+
+        let loaded = load_brief(&project).unwrap();
+        assert!(loaded.contains("Daily Puzzle"));
+        let agents = fs::read_to_string(project.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("Daily Puzzle"));
+        let readme = fs::read_to_string(project.join("README.md")).unwrap();
+        assert!(readme.contains("Daily Puzzle"));
+        assert!(!readme.contains("## Product brief\n\nold brief"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_lock_blocks_duplicate_workers_and_recovers_after_drop() {
+        let root = std::env::temp_dir().join(format!("appforge-lock-test-{}", epoch()));
+        let project = create(&root, "lock test").unwrap();
+
+        let first = acquire_stage_lock(&project, "quality").unwrap();
+        let second = acquire_stage_lock(&project, "qa").unwrap_err();
+        assert_eq!(second.kind(), io::ErrorKind::AlreadyExists);
+
+        drop(first);
+        let third = acquire_stage_lock(&project, "qa").unwrap();
+        drop(third);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

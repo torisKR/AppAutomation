@@ -26,6 +26,9 @@ for gate, keyword, report in [('quality', 'FUNCTIONAL + PERFORMANCE', '04-qualit
         (p / 'docs' / (report + '.md')).write_text('Checks executed; evidence recorded')
         if not (p / 'missing-decision').exists():
             (p / '.appforge' / (gate + '-decision')).write_text('BLOCKED' if (p / 'blocked').exists() else 'PASS')
+if 'PRIMARY RELEASE ORCHESTRATOR' in prompt:
+    (p / 'docs' / '08-release.md').write_text('Decision: **READY**')
+    (p / '.appforge' / 'release-decision').write_text('PASS')
 '''
     for name in ['codex', 'claude']:
         path = tools / name
@@ -40,7 +43,7 @@ for gate, keyword, report in [('quality', 'FUNCTIONAL + PERFORMANCE', '04-qualit
         assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
         return result
 
-    assert '0.2.2' in run('version').stdout
+    assert '0.3.0' in run('version').stdout
     help_text = run('help').stdout
     assert 'repair-all' in help_text and 'approve-publish' in help_text and 'publish [project]' in help_text
     assert 'daemon=no' in run('computer', 'status').stdout

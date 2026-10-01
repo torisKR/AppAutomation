@@ -300,12 +300,24 @@ pub(crate) fn subscription_environment(cmd: &mut Command, id: &str) {
     }
 }
 
+#[cfg(test)]
 fn configure_command(
     id: &str,
     binary: &Path,
     cwd: &Path,
     prompt: &str,
     auto: bool,
+) -> io::Result<Command> {
+    configure_command_with_effort(id, binary, cwd, prompt, auto, "medium")
+}
+
+fn configure_command_with_effort(
+    id: &str,
+    binary: &Path,
+    cwd: &Path,
+    prompt: &str,
+    auto: bool,
+    codex_effort: &str,
 ) -> io::Result<Command> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd);
@@ -316,20 +328,40 @@ fn configure_command(
         "codex" => {
             cmd.args([
                 "exec",
+                "-m",
+                "gpt-5.6-sol",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "--enable",
+                "fast_mode",
+                "--disable",
+                "plugins",
+                "--disable",
+                "apps",
+                "--disable",
+                "skill_search",
+                "--enable",
+                "skip_host_skill_discovery",
                 "--json",
-                "--sandbox",
-                "workspace-write",
                 "-c",
                 "forced_login_method=\"chatgpt\"",
                 "-c",
                 "model_provider=\"openai\"",
+                "-c",
+            ])
+            .arg(format!("model_reasoning_effort=\"{codex_effort}\""))
+            .args(["-c", "suppress_unstable_features_warning=true"]);
+            // AUTO controls whether AppForge schedules the next stage; it must
+            // not weaken Codex's execution boundary. Both modes run non-interactively
+            // inside workspace-write and deny actions that would require approval.
+            cmd.args([
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "-c",
+                "approval_policy=\"never\"",
             ]);
-            if auto {
-                cmd.arg("--approve-for-me");
-            } else {
-                // Headless manual stages deny requests requiring approval.
-                cmd.args(["-c", "approval_policy=\"never\""]);
-            }
             cmd.arg("-C").arg(cwd).arg("--").arg(prompt);
         }
         "claude" => {
@@ -391,15 +423,45 @@ fn configure_command(
     Ok(cmd)
 }
 
-pub fn run_task(
+#[derive(Clone, Copy, Debug)]
+pub struct TaskRunOptions<'a> {
+    pub auto: bool,
+    pub strict_subscription_auth: bool,
+    pub timeout: std::time::Duration,
+    pub codex_effort: &'a str,
+}
+
+pub fn run_task_bounded(
     id: &str,
     cwd: &Path,
     prompt: &str,
     auto: bool,
     strict_subscription_auth: bool,
     tx: Sender<String>,
+    timeout: std::time::Duration,
 ) -> io::Result<()> {
-    if strict_subscription_auth && id == "opencode" {
+    run_task_bounded_with_options(
+        id,
+        cwd,
+        prompt,
+        tx,
+        TaskRunOptions {
+            auto,
+            strict_subscription_auth,
+            timeout,
+            codex_effort: "medium",
+        },
+    )
+}
+
+pub fn run_task_bounded_with_options(
+    id: &str,
+    cwd: &Path,
+    prompt: &str,
+    tx: Sender<String>,
+    options: TaskRunOptions<'_>,
+) -> io::Result<()> {
+    if options.strict_subscription_auth && id == "opencode" {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "OpenCode Go uses a subscription API key, not OAuth. Disable strict_subscription_auth to allow it.",
@@ -410,10 +472,17 @@ pub fn run_task(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{id} CLI missing")))?;
     let cwd = cwd.canonicalize()?;
     let _ = tx.send(format!("{} ▶ {}", label(id), compact(prompt, 120)));
-    let mut child = configure_command(id, &binary, &cwd, prompt, auto)?
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = configure_command_with_effort(
+        id,
+        &binary,
+        &cwd,
+        prompt,
+        options.auto,
+        options.codex_effort,
+    )?
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -435,7 +504,23 @@ pub fn run_task(
         }
     });
 
-    let status = child.wait()?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= options.timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_handle.join();
+            let _ = err_handle.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{} task exceeded its time limit", label(id)),
+            ));
+        }
+        thread::sleep(std::time::Duration::from_millis(250));
+    };
     let _ = out_handle.join();
     let _ = err_handle.join();
 
@@ -515,9 +600,34 @@ mod tests {
                 }
             }
         }
-        assert!(args("codex", true).contains(&"--approve-for-me".into()));
-        assert!(args("codex", false).contains(&"approval_policy=\"never\"".into()));
+        let codex_auto = args("codex", true);
+        assert!(codex_auto.contains(&"gpt-5.6-sol".into()));
+        assert!(codex_auto.contains(&"--ignore-user-config".into()));
+        assert!(codex_auto.contains(&"--skip-git-repo-check".into()));
+        assert!(codex_auto.contains(&"fast_mode".into()));
+        assert!(codex_auto.contains(&"plugins".into()));
+        assert!(codex_auto.contains(&"skip_host_skill_discovery".into()));
+        assert!(codex_auto.contains(&"--sandbox".into()));
+        assert!(codex_auto.contains(&"workspace-write".into()));
+        assert!(codex_auto.contains(&"sandbox_workspace_write.network_access=true".into()));
+        assert!(codex_auto.contains(&"approval_policy=\"never\"".into()));
+        assert!(!codex_auto.contains(&"--approve-for-me".into()));
+        let codex_manual = args("codex", false);
+        assert_eq!(codex_auto, codex_manual);
         assert!(args("codex", true).contains(&"forced_login_method=\"chatgpt\"".into()));
+        let low_effort = configure_command_with_effort(
+            "codex",
+            Path::new("codex"),
+            Path::new("/tmp"),
+            "brief",
+            true,
+            "low",
+        )
+        .unwrap()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert!(low_effort.contains(&"model_reasoning_effort=\"low\"".into()));
         assert!(args("claude", true).contains(&"--verbose".into()));
     }
 
@@ -555,7 +665,16 @@ mod tests {
     #[test]
     fn strict_auth_blocks_opencode_before_starting_a_cli() {
         let (tx, _) = std::sync::mpsc::channel();
-        let err = run_task("opencode", Path::new("/tmp"), "brief", true, true, tx).unwrap_err();
+        let err = run_task_bounded(
+            "opencode",
+            Path::new("/tmp"),
+            "brief",
+            true,
+            true,
+            tx,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(configure_command(
             "unknown",

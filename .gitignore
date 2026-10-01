@@ -2,3 +2,4 @@
 .DS_Store
 *.log
 .appforge-local
+.tmp-appforge-config/
